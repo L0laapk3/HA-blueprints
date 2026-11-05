@@ -1,0 +1,204 @@
+blueprint:
+  name: Tailscale login
+  author: L0laapk3
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  description: |
+    Note: vibecoded.
+
+    Sends a notification with a one-tap login link when the Tailscale container
+    on your server is logged out (for example after its node key expired), clears
+    it once Tailscale is running again, and warns before the key expires.
+
+    **Requirements** (Home Assistant and Tailscale in Docker on the same host):
+
+    1. Share Tailscale's control socket with Home Assistant through a named volume
+    in `compose.yaml`:
+
+    ```yaml
+    services:
+      tailscale:
+        environment:
+          - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+        volumes:
+          - tailscale-socket:/var/run/tailscale
+      homeassistant:
+        volumes:
+          - tailscale-socket:/run/tailscale
+    volumes:
+      tailscale-socket:
+    ```
+
+    Remove `TS_AUTHKEY` once the node is logged in: an expired auth key makes the
+    container restart in a loop instead of waiting for an interactive login.
+
+    2. Add the sensors and the login command to `configuration.yaml`:
+
+    ```yaml
+    command_line:
+      - sensor:
+          name: Tailscale
+          unique_id: tailscale_backend_state
+          command: >-
+            curl -sf -H 'Sec-Tailscale: localapi' --unix-socket /run/tailscale/tailscaled.sock
+            'http://local-tailscaled.sock/localapi/v0/status?peers=false'
+          value_template: "{{ value_json.BackendState }}"
+          json_attributes:
+            - AuthURL
+          scan_interval: 300
+      - sensor:
+          name: Tailscale key expiry
+          unique_id: tailscale_key_expiry
+          device_class: timestamp
+          command: >-
+            curl -sf -H 'Sec-Tailscale: localapi' --unix-socket /run/tailscale/tailscaled.sock
+            'http://local-tailscaled.sock/localapi/v0/status?peers=false'
+          value_template: "{{ value_json.Self.KeyExpiry | default(none) }}"
+          scan_interval: 3600
+
+    shell_command:
+      tailscale_start_login: >-
+        curl -sf -X POST -H 'Sec-Tailscale: localapi' --unix-socket /run/tailscale/tailscaled.sock
+        http://local-tailscaled.sock/localapi/v0/login-interactive
+    ```
+
+    3. Recreate both containers (`docker compose up -d tailscale homeassistant`),
+    then create an automation from this blueprint.
+  input:
+    status_sensor:
+      name: Tailscale status sensor
+      description: Sensor whose state is Tailscale's backend state and that has an `AuthURL` attribute.
+      default: sensor.tailscale
+      selector:
+        entity:
+          filter:
+            domain: sensor
+    expiry_sensor:
+      name: Key expiry sensor
+      description: Timestamp sensor with the node key expiry. Leave empty to skip the expiry warning.
+      default: sensor.tailscale_key_expiry
+      selector:
+        entity:
+          filter:
+            domain: sensor
+            device_class: timestamp
+    warning_days:
+      name: Expiry warning
+      description: How long before the key expires to warn.
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: days
+    start_login_action:
+      name: Start login action
+      description: Action that asks Tailscale for a login link when none is pending yet.
+      default: shell_command.tailscale_start_login
+      selector:
+        text:
+    notify_action:
+      name: Notify action
+      description: Where to send the push notification. `notify.notify` sends it to every device.
+      default: notify.notify
+      selector:
+        text:
+
+trigger_variables:
+  expiry_sensor: !input expiry_sensor
+  warning_days: !input warning_days
+
+triggers:
+- trigger: state
+  entity_id: !input status_sensor
+  to: NeedsLogin
+  id: logged_out
+- trigger: state
+  entity_id: !input status_sensor
+  attribute: AuthURL
+  id: logged_out
+- trigger: state
+  entity_id: !input status_sensor
+  to: Running
+  id: running
+- trigger: template
+  value_template: >-
+    {% set expiry = states(expiry_sensor) | as_datetime(none) %}
+    {{ expiry is not none and expiry - now() < timedelta(days=warning_days | int) }}
+  id: expiring
+
+variables:
+  status_sensor: !input status_sensor
+  start_login_action: !input start_login_action
+  notify_action: !input notify_action
+
+actions:
+- choose:
+  - conditions:
+    - condition: trigger
+      id: logged_out
+    - condition: state
+      entity_id: !input status_sensor
+      state: NeedsLogin
+    sequence:
+    - if:
+      - condition: template
+        value_template: "{{ start_login_action != '' and not state_attr(status_sensor, 'AuthURL') }}"
+      then:
+      - action: "{{ start_login_action }}"
+      - delay: 00:00:05
+      - action: homeassistant.update_entity
+        target:
+          entity_id: "{{ status_sensor }}"
+    - variables:
+        url: "{{ state_attr(status_sensor, 'AuthURL') }}"
+    - action: persistent_notification.create
+      data:
+        notification_id: tailscale_login
+        title: Tailscale is logged out
+        message: >-
+          Remote access via Tailscale is down until the server logs in again.
+          {% if url %}[Log in to Tailscale]({{ url }}){% else %}No login link
+          yet: restart the Tailscale container and check its logs.{% endif %}
+    - action: "{{ notify_action }}"
+      data:
+        title: Tailscale is logged out
+        message: Tap to log in again.
+        data:
+          ttl: 0
+          priority: high
+          tag: tailscale_login
+          persistent: true
+          sticky: true
+          clickAction: "{{ url }}"
+          url: "{{ url }}"
+  - conditions:
+    - condition: trigger
+      id: running
+    sequence:
+    - action: persistent_notification.dismiss
+      data:
+        notification_id: tailscale_login
+    - action: "{{ notify_action }}"
+      data:
+        message: clear_notification
+        data:
+          tag: tailscale_login
+  - conditions:
+    - condition: trigger
+      id: expiring
+    sequence:
+    - action: persistent_notification.create
+      data:
+        notification_id: tailscale_key_expiry
+        title: Tailscale key expires soon
+        message: >-
+          The Tailscale login for this server expires on
+          {{ states(expiry_sensor) | as_datetime | as_local }}.
+          Disable key expiry for this machine in the
+          [Tailscale admin console](https://login.tailscale.com/admin/machines)
+          to keep it connected.
+
+mode: single
+max_exceeded: silent
